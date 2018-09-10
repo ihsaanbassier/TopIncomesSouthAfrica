@@ -1,0 +1,847 @@
+---
+title: "Top incomes during low growth"
+author: "Ihsaan Bassier and Ingrid Woolard"
+date: '`r format(Sys.time(), "%d %B, %Y")`'
+output:
+  pdf_document: default
+  html_notebook: default
+  html_document: default
+  word_document: default
+subtitle: An analysis of South Africa's top percentiles post recession
+---
+
+
+```{r include=FALSE}
+
+setwd("C:/Users/ihsaa/Dropbox/Tax/Analysis")
+
+#Packages
+library(stringr)
+library(knitr)
+library(tidyverse)
+library(survey)
+library(gridExtra)
+library("directlabels")
+
+#Functions
+
+toppercentiles <- function(sample=Rep2011, adults= 33.71e6, 
+                           topincs=620, wgt=5*100/93.3){
+  obs <- nrow(sample)
+  percentiles <- c(1-(0.05*adults-topincs)/(obs*wgt),
+                   1-(0.025*adults-topincs)/(obs*wgt),
+                   1-(0.01*adults-topincs)/(obs*wgt),
+                   1-(0.001*adults-topincs)/(obs*wgt),
+                   1-(0.0001*adults-topincs)/(obs*wgt))
+  #Unclear what the equation does
+}
+
+prepdata <- function(df=Bracket){
+  df <- df[, colSums(is.na(df)) != nrow(df)]    #Delete null columns
+  df <- df[rowSums(is.na(df)) != ncol(df), ] 
+  df <- merge(x=df, y=Aggreg, by="year", all.x=T)
+  
+  df$bracketIncome <- df$bracketIncome*1e6*(1/df$percAssessed) #Rescale to likely number
+  df$numTaxpayers <- df$numTaxpayers*(1/df$percAssessed)
+  df %>% arrange(year, desc(minBracket)) %>% group_by(year) %>%
+    mutate(cumTaxpayers= cumsum(numTaxpayers), cumIncome= cumsum(bracketIncome))
+}
+
+#General function that takes a percentile and tax bracket data set
+#And computes shares and incomes of the percentile
+topperc <- function(perc=0.99, df=Bracket) {
+  Top <- df %>% group_by(year) %>% 
+    filter(abs((1-perc)*adults-cumTaxpayers)==min(abs((1-perc)*adults-cumTaxpayers))) %>%
+    mutate(paretob= (cumIncome/cumTaxpayers)/minBracket, emp.perc= 1-cumTaxpayers/adults) %>%
+    mutate(paretoa= paretob/(paretob-1), paretok= minBracket*(cumTaxpayers/adults)^(1/paretoa)) %>%
+    mutate(percentile= as.factor(perc), income= paretok/(1-perc)^(1/paretoa)) %>% 
+    mutate(share= income*paretob*(1-perc)*adults/gni_nom, 
+           realincome= income*100/cpi, realgni= gni_nom*100/cpi,
+           realgni.95= (gni_nom-income*paretob*(1-perc)*adults)*100/cpi) %>%
+    mutate(valid= income>=threshold) %>%
+    select(year, emp.perc, percentile, realincome, share, realgni, realgni.95, valid)
+  #Restrict to "perc" percentile, use pareto distribution to impute income, compute other stats
+  
+  cagr <- Top %>% filter(valid==T) %>% group_by(percentile) %>%
+    summarise(cagr= (last(realincome)/first(realincome))^(1/(last(year)-first(year)))-1)
+  Top$cagr <- as.numeric(cagr[1,2])
+  gni.cagr <- Top %>% group_by(percentile) %>%
+    summarise(gni.cagr= (last(realgni)/first(realgni))^(1/(last(year)-first(year)))-1)
+  Top$gni.cagr <- as.numeric(gni.cagr[1,2])
+  #Calculate cagr and add to dataset
+  
+  Top
+}
+
+#Takes a vector of percentiles, apply previous fx, and also calculates share differences
+toppercs <- function(percs= c(0.95, 0.975, 0.99, 0.999, 0.9999),  data= Bracket) {
+  Top <- do.call(rbind, lapply(percs, topperc, df=data)) 
+  Top %>% group_by(year) %>% arrange(year, as.numeric(percentile)) %>%
+    mutate(sharediff= share-lead(share)) %>% 
+    mutate(sharediff= ifelse(is.na(sharediff), share, sharediff))
+}
+
+#Analysis on microfiles
+reppercs <- function(percs= c(0.95, 0.975, 0.99, 0.999, 0.9999),  df=Rep2011,
+                     adults= 3.37E7, topnum=620, topinc= 8.63e9, gni=2.95558E12, 
+                     cpi=74.2, topworkinc=  4.49e9, topcapinc= 8.70e9) {
+  df <- df %>% arrange(desc(taxableincome)) %>%
+    mutate(cuminc= cumsum(taxableincome*5*weight) + topinc,
+           cumworkinc= cumsum(workinc*5*weight) + topworkinc,
+           cumcapinc= cumsum(otherinc*5*weight) + topcapinc,
+           cumadults= cumsum(dummy*5*weight)+topnum)
+  #20% sample and not all captured so weight up, add top incomes manually
+  
+  repperc <- function(perc, dat=df) {
+    dat <- dat %>%
+      filter(abs((1-perc)*adults-cumadults)==min(abs((1-perc)*adults-cumadults))) %>%
+      mutate(share= cuminc/gni, realincome= taxableincome*100/cpi, 
+             percentile=perc,
+             aveworkinc= cumworkinc/cumadults*100/cpi, 
+             avecapinc= cumcapinc/cumadults*100/cpi,
+             capitalshare= cumcapinc/(cumworkinc+cumcapinc)) %>%
+      select(percentile, realincome, share, aveworkinc, avecapinc, capitalshare)
+  }
+  #Allows comparison of tax tables to microfiles
+  
+  #Apply this function over all percentiles
+  do.call(rbind, lapply(percs, repperc)) 
+  
+}
+
+#Tax bracket analysis on sources/benefits
+#Same logic as above.
+benefitpercs <- function(percs= c(0.95, 0.975, 0.99, 0.999, 0.9999),  data= Bracket) {
+  
+  benefitperc <- function(perc=0.99, df=Bracket) {
+    Top <- df %>% group_by(year) %>% 
+      filter(abs((1-perc)*adults-cumTaxpayers)==min(abs((1-perc)*adults-cumTaxpayers))) %>%
+      mutate(emp.perc= 1-cumTaxpayers/adults, percentile= as.factor(perc)) %>%
+      mutate(real.average.income= cumIncome/cumTaxpayers*100/cpi) %>% 
+      select(year, percentile, emp.perc, real.average.income)
+  
+      cagr <- Top %>% group_by(percentile) %>%
+        summarise(cagr= (last(real.average.income)/first(real.average.income))^
+                    (1/(last(year)-first(year)))-1)
+      Top$cagr <- as.numeric(cagr[1,2])
+      Top
+    }
+  Top <- do.call(rbind, lapply(percs, benefitperc, df=data)) 
+}
+
+gic <- function(percs, df=Palms, dsn= palms.w, egni=4.15919E+12, sgni=2.6832E+12){
+  maxyear <- max(df$year)
+  minyear <- min(df$year)
+  numyears <- maxyear-minyear
+  
+  endmean <- svymean(subset(df, year==maxyear)$imprealearnings,subset(dsn, year==maxyear))
+  startmean <- svymean(subset(df, year==minyear)$imprealearnings,subset(dsn, year==minyear))
+  mean <- (endmean/startmean)^(1/numyears)-1
+  mean <- mean[1]
+
+  gni <- ((egni/sgni)^(1/numyears)-1)*100
+
+  growth <- function(perc, data=df, dess=dsn, syear=minyear, eyear=maxyear){
+    endq <- svyquantile(subset(data, year==eyear)$imprealearnings, 
+                      subset(dess, year==eyear), quantiles=perc)
+    startq <-  svyquantile(subset(data, year==syear)$imprealearnings, 
+                         subset(dess, year==syear), quantiles=perc)
+    meanq <- svyquantile(data$imprealearnings, dess, quantiles=perc)
+    cagr <- ((endq/startq)^(1/numyears)-1)*100
+    cagr <- ifelse(endq<=0 | startq<=0, NA, cagr)
+      
+    data.frame(perc, cagr, mean, gni, meanq, startq, endq)
+  }
+  Gic <- do.call(rbind, lapply(percs, growth))
+  Gic%>% mutate(percentile=perc*100) %>% select(-perc)
+}
+
+distperc <- function(perc, dat=Palms) {
+  dat <- dat %>% group_by(year) %>% arrange(imprealearnings) %>%
+          mutate(cuminc= cumsum(imprealearnings*ceweight2), 
+           cumadults= cumsum(dummy*ceweight2), est.adults= sum(dummy*ceweight2), 
+           totinc= sum(imprealearnings*ceweight2))
+
+  dat %>% group_by(year) %>%
+      filter(abs(perc*est.adults-cumadults)==min(abs(perc*est.adults-cumadults))) %>%
+      mutate(share= 1-cuminc/totinc, realincome=imprealearnings, 
+             percentile=as.factor(perc)) %>%
+      select(year, percentile, realincome, share)
+}
+
+```
+
+\begin{abstract}
+
+The low growth post recession in South Africa has not extended to the rich, those earning above R300 000 per year (2016 Rands). Using tax data, we find that top percentile incomes increased rapidly through the entire period 2003-2016, growing on average over 5 percent per year, undeterred by the recession, and strongly outpacing GNI growth from 2010 onward. Between 2010 and 2015 alone, the income share of the top 1 percent increased from 10.5 to 13 percent of GNI. We put this in context using survey data to estimate growth over the full income distribution. Growth follows a U-shape, with some growth at very low incomes, barely any growth for the bulk of the distribution, and rapid growth for the rich. There is considerable hetereogeneity at the top, with salary and bonuses progressively decreasing as a proportion of total income from about 80 percent at the 95th percentile to 50 percent at the 99th percentile. An "r>g" argument partly explains the divergence in growth rates at the top, and we find extraordinary real growth rates of 10-20 percent in income from capital over 2011-2014. Despite the focus on inclusive economic growth in one of the most unequal countries in the world, this suggests inequality has in fact worsened.
+
+\end{abstract}
+
+#1. Introduction
+
+This paper investigates how top incomes in South Africa have evolved during this period of stagnation post the global recession. South Africa's poor economic performance since 2008 is the source of much angst: over this period, national income has grown on average under under 2% per year (compared to about 5% over the five years prior), and official unemployment increased from 23% to 27% (SARB 2017). Yet, we know very little of the impact of growth across the income distribution, particularly the evolution of the top percentiles in a country that is renowned for its high levels of inequality. 
+
+The remarkable and steep increase in top income percentile shares, particularly in the Anglosphere, in decades prior to the Great Recession has been well-documented by Atkinson, Piketty, Saez and others (Atkinson and Piketty 2010 give a collection of papers surveying top incomes across varied countries; see figure 1). Following a period of decline and then stability post the Great Depression, this upward trend the richest 1% share of national income begins in 1980 - a year which has been characterised as the onset of the neoliberal era ushering in pro-business and anti-labour policies - for example in USA from 9% to 24% over 1980-2007 (Piketty and Saez 2013). Alvaredo and Atkinson (2010) show South Africa follows a similar trend over the 20th century, albeit with a slight delay attributed to the political turmoil of the 1980s. For South Africa, this period was characterised by acute skills-biased technical change, decline of industries demanding lower skills, and an increase in the supply of unskilled labour (Banerjee et al 2006). Did the Great Recession disrupt the trend of increased shares of the top 1%? Piketty and Saez (2013) observe a sharp rebound of the top 1% share in the US. They further argue that the trend will continue unless there is a broad shift in institutional policy similar to the reforms following the 1929 Great Depression, which precipitated a sustained decline in top income shares.
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+
+#Line 300 of topshares.R
+
+Wid <- read.csv("WID_Data_top1p.csv")
+Wid <- Wid %>% gather(country, share, Australia:South_Africa) %>% mutate(share=100*share)
+
+ggplot(data=Wid, mapping=aes(x=Year, y=share, group=country, colour=country)) +
+  geom_line() + geom_point() + theme(axis.text.x = element_text(angle=90)) + ylab("% share") +
+  geom_dl(aes(label= country), method = list(dl.combine("last.points"), cex = 0.8)) +
+  scale_x_continuous(breaks=seq(1913,2014,10), limits=c(1913, 2018))
+
+```
+
+In this paper, we aim to add to this literature by focusing on top income percentiles in South Africa in the low national growth period following the 2008 recession. First, we expand on Alvaredo and Atkinson's (2010) work, which gives South African top income percentiles for 1903-2007. We compile tax data for the period 2003-2015 using fairly detailed official public annual tax tables. We find that top percentile incomes increased rapidly through the entire period, growing on average over 5% per year, undeterred by the recession and  diverging strongly from GNI growth from 2010 onward - between 2010 and 2015, the income share of the top 1% increased from 10.5% to 13% of GNI. Next, we put this in context by using survey data to estimate growth over the full income distribution during this period. Growth followed a distinct U-shape, with some growth at very low incomes, barely any growth in the middle and rapid growth at the very top. Thus since democracy in 1994, the cross-sectional incomes of the middle 40% of the earning population *decreased* in real terms.  We take a brief detour by comparing estimates of top incomes from tax data to estimates from several commonly used surveys. The accuracy of income measurement in surveys varies, containing results that may possibly be useful for inequality analysis (where top incomes are influential).
+
+We conclude by offering explanations for this growth trend. We find some support for Piketty's influential "r>g" argument that a high rate of capital growth relative to overall economic growth can drive up inequality. We track income derived from capital between 2011 and 2014, finding extraordinary growth rates of 10-20% in the top percentiles against an environment with low overall economic growth.
+
+In a policy context which calls for "inclusive growth" and "radical economic change", it seems as if South Africa's economy is heading in the opposite direction. The clear and persistent proliferation of an elite amidst stagnation in the rest of the population highlights the urgency of a thorough re-evaluation of the country's economic strategy.
+
+#2. Literature Review
+
+It is useful to begin by contextualising the international growth trends. The World Incomes Database provides data on top incomes and shares for several countries by combining tax and survey data. The data for South Africa is slightly different to the results in this paper, as one may expect from differences in methodology (see Alvaredo and Atkinson 2013 for details), but the trend is preserved. Figure 2 shows the rapid uptick in the top 1% share between 2002 and 2007, reducing around the time of the recession and beginning to increase again thereafter before ending in 2012. 
+
+For comparison, we show data for selected countries based on availability and to highlight the following points. Firstly, it is clear that there is strong variation in the level of percentile shares. In figure 2, we see that the top 1% level in France and China hold far less than the top 1% in USA, South Africa or Colombia. Consequently, the middle share is much greater in France and China, illustrated in figure 3. Secondly, there is also wide variation in *trends*. In France, percentile shares appear stable. The top 1% in China appears to be losing ground and the middle 40% rapidly gaining ground. Like South Africa, the top 1% in USA is increasing its share while the middle 40% is decreasing. Using different data, growth incidence curves for Latin America show pro-poor growth, starting at 6% growth at the bottom of the distribution and decreasing to 2% growth near the top over the period 2003-2014 (World Bank 2017). 
+
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+
+#Line 300 of topshares.R
+
+Wid <- read.csv("WID_Data.csv")
+Wid <- Wid %>% gather(country, share, Australia:Uruguay) %>%
+  group_by(country, Percentile) %>% filter(sum(!is.na(share))>5)%>% mutate(share=100*share)
+
+top <- ggplot(data=Wid %>% filter(Percentile=="p99p100", country %in% 
+                             c("USA", "France", "South.Africa", "China", "Mayalsia", "Colombia")),
+       aes(x=Year, y=share, group=country, colour=country)) +
+  geom_line() + ylab("top 1%, % share") +
+  geom_point() + theme(legend.position="none") +
+  geom_dl(aes(label= country), method = list(dl.combine("last.points"), cex = 0.8)) +
+  scale_x_continuous(breaks=seq(2003,2015,2), limits=c(2003, 2016))
+
+
+middle <- ggplot(data=Wid %>% filter(Percentile=="p50p90"),
+       aes(x=Year, y=share, group=country, colour=country)) +
+  geom_line() + ylab("p50-p90, % share") +
+  geom_point() + theme(legend.position="none") +
+  geom_dl(aes(label= country), method = list(dl.combine("last.points"), cex = 0.8)) +
+  scale_x_continuous(breaks=seq(2003,2015,2), limits=c(2003, 2016))
+
+grid.arrange(top, middle, ncol=2, nrow=1)
+
+```
+
+Thirdly, it seems that, like in South Africa, the recession caused a brief shock, but did not fundamentally alter any of the trends. Data for USA presents the most dramatic shock, where the top 1% share had "recovered" by 2014. Piketty and Saez (2013) argue, regarding "what is probably the most spectacular result coming from the WTID [dataset], namely, the very pronounced U-shaped evolution of top income shares in the United States over the past century", that "the Great Recession of 2008-09 seems unlikely to reverse the long-run trend". They use this as support for their view that policies and institutions hold a decisive influence over the evolution of income shares: arguing that the drop in top percentile shares following the Great Depression was due to the drastic shift in policies rather than a consequence of the economic downturn, this data provides the counterfactual where policy did not shift and consequently the trend has continued.
+
+Related work on South Africa has been done by Orthoffer (2016) who also uses tax data but focuses on wealth inequality. She briefly refers to some income calculations, for example that the top 1% of the employed population earns 12% of labour market income. Regarding income inequality, there are few analyses of inequality over the post recession period focused on in this paper (2010-2016). Hundenborn et al (2016) find that the Gini coefficient increased between 1993 and 2008 from 0.681 to 0.69, but then dropped to 0.655 in 2014. We will see that an opposite trend in inequality is suggested post 2008, certainly when measured crudely as the share of the top percentiles in national income. Given the above work on South Africa, we are still left with pressing questions: What is the trajectory of top income shares post recession? How does this compare to the rest of the distribution? Where do the top income receivers get their money, and, relatedly, how much does income from capital (compared to labour) drive growth at the top?
+
+#3. Data
+
+This paper aims to compare the growth in top incomes relative to the growth of the rest of the income distribution post-2008. To investigate this, two separate datasets have been used: The aggregate personal income statistics which are released as part of the South African Revenue Service's annual Tax Statistics (SARS, 2016) and the Post-Apartheid Labour Market Series, or PALMS (Kerr, Lam and Wittenberg 2016). The choice to use two different datasets is informed by the knowledge that while, in South Africa, tax statistics do a fairly good job at capturing information about the incomes at the top end of the income distribution, it does not sufficiently capture information about the those with incomes below the mandatory tax threshold (since many records are voluntary). Conversely, survey data such as PALMS is considered a reliable source of labour market data (Kerr and Wittenberg 2016), and therefore captures information well about the rest of the income distribution where labour market income is the dominant source. While we would ideally have liked to use a single dataset which fully and accurately captures both the top and bottom end of the income distribution, such a dataset is not currently available for South Africa. Hence, the second-best solution is to use the two separate datasets with the caveat that they will not always be comparable was decided upon. The next two subsections describe and discuss some of the advantages and challenges of the two datasets.
+
+##3.1 Top incomes: South African Revenue Service's annual Tax Statistics
+
+This paper uses tax data to investigate growth in top incomes. Specifically, it uses the aggregate personal income tax statistics which are released as part of the South African Revenue Service's annual Tax Statistics (SARS 2017). These statistics include data on incomes, sources, and tax deductions for tax filers (see table 1 in the appendix for an example of the data given). These tables should capture all residents who receive incomes above a threshold, allowing for analysis of top income percentiles for the years 2003-2015. For example, in 2011 there were nearly 6 million tax filers, 3 million of whom had incomes above the compulsory filing threshold of R120 000 and thus representing just under the top 10% of the South African adult distribution.
+
+Tax data has, beginning with Kuznets (1953), historically been used for analysis of top incomes. Unlike survey data, it does not rely on the willingness of income recipients to disclose their incomes, or on their ability to recall incomes accurately. A combination of legal checks (tax evasion is punishable by imprisonment), lack of choice (companies pay tax on salaries on employees' behalf), and strong incentives for the revenue service to track down non-disclosure (tax is the primary income source for the state) results in much more accurate estimates of top incomes.
+
+Of course, tax data has its flaws. Tax filers often submit late; the 2014 tax tables show that 80% of expected tax filers for 2013 had been assessed, which increased to 87% by 2016. To resolve this issue, the aggregate statistics could simply be scaled up. However, if late filing is correlated with income it may result in biased estimates of top incomes. Figure 4 in the appendix shows the difference between the first and last years observed by tax bracket, providing some reassurance that there is little cause for concern. Still, predicting the percentage of tax filers who are late is an imprecise art, yet incomes need to be scaled up based on these predictions. We can only hope that the estimates provided in the tax tables are not systematically biased over time. Another limitation of tax data is that those who illegally hide incomes (tax evaders) are not captured, and the extent to which tax avoidance (those who legally structure incomes to pay less tax) biases the data is unclear. The latter is highlighted by the Davis Tax Committee (2016). It notes that the divergences between top PIT and CIT rates in South Africa results in arbitrage opportunities, since high income individuals can divert their income through lower-taxed companies or trusts. The final transfer to personal accounts could be timed to coincide with a decrease in marginal tax rates years later, or permanently deferred through a trust for an alternate purpose.
+
+Unfortunately for the focus of this paper, the severity of these problems probably increases with income. Nevertheless, these problems are likely even more severe using other sources such as survey data.
+
+Before continuing, a few definitions are in order. The main measure analysed in this paper is taxable income, which consists of all income after deductions (for example medical aid, travel, and pension), but before taxes or transfers such as remittances or government grants. The South African tax year runs from March to February: the 2011 tax year ran from 1 March to 28 February 2011. All calculations pertain to the full South African adult income distribution, and includes zero incomes. We wanted to include people who are unemployed, but exclude people who could not reasonably receive an income. Of course, this is tricky to define; we decided to restrict the population to adults aged 18 years and older. The 2011 census estimates that adults comprised 65% of the population, about 33.71 million people. In practice, the tax data captures incomes from any age group, though income from children is small: less than 1% of tax filers were aged below 18, constituting less than 0.5% of total filed income. In 2011, the top 1% of earners made 6% of all tax filers (nearly 6 million individuals) or 3% of all registered taxpayers (over 10 million).
+
+##3.2 Rest of Income Distribution: PALMS
+
+For this section of the paper, we utilize the Post Apartheid Labour Market Series or PALMS (Kerr, Lam and Wittenberg 2016). PALMS stacks microdata from 54 surveys conducted by the national statistical agency (Stats SA) across the period 1993-2015, with the aim of enabling earnings comparisons across different surveys and years. We focus on data from 2003 to 2014, which combines bi-annual Labour Force Surveys from 2003-2007 and the Quarterly Labour Force Survey (QLFS) for years 2008-2014. There is no income information for the years 2008 and 2009. We have used the multiply imputed incomes provided in PALMS in place of missing incomes and income bracket responses, and simply averaged incomes across waves to find average income for a percentile in a given year.
+
+At this point, it is worth taking a short detour to compare the available surveys, specifically for our purposes the income percentiles of the South African adult population as reported in these various datasets. We look at three nationally representative household surveys, commonly used for example to calculate inequality measures like the Gini coefficient (see, for instance, Leibbrandt et al 2012). The Gini coefficient is sensitive to changes in top incomes, yet survey data tends to underestimate these incomes, because richer people refuse to answer, under-report, or are simply too rare to be picked up by samples. To dwell on the importance of this for inequality and income measurement: Piketty and Saez (2013) note that "with standard surveys based on limited sample size and self-reported income [...] one cannot measure properly incomes above the 90th percentile, and therefore one largely misses the magnitude of the trend that has been going on".As a standard against which to assess the accuracy of top incomes reported in surveys, we use 2011 tax microfiles which start at the threshold of compulsory submission of returns corresponding to just above the 90th percentile.
+
+Firstly, the Income and Expenditure Survey (IES) of 2010/11 is a cross-sectional survey carried out by Stats SA (2015) and repeated every 5 years and which contains over 95 000 observations. Incomes in the dataset sum to 46% of GNI. The top percentiles track the tax estimates reasonably well up to the 99th percentile, before underestimating the remainder quite severely.
+
+The National Income Dynamics Study (NIDS) for 2010/11 is wave 2 of a panel series (Southern Africa Labour and Development Research Unit 2012), with about 30 000 observations. NIDS incomes only sum to 37% of GNI, and the percentiles perform much worse than IES. Interestingly, it underestimates incomes consistently by about 30% from the 91st percentile inwards, though it appears to pick up a few large incomes at the very top. Unlike IES, then, NIDS may not suffer as acutely from biasing top incomes downwards.
+
+Finally, the relevant wave from the PALMS dataset described above is QLFS quarter 4 of 2010, containing about 30 000 observations. Just like NIDS, incomes in this survey sum to 37% of GNI. It generally performs better than NIDS but worse than IES in income percentiles. As with IES, the estimates become less accurate higher in the distribution. Note that QLFS is at a disadvantage in this comparison, because it excludes non-labour market earnings and so is necessarily an underestimate. Wittenberg (2017) compares the QLFS against tax data in detail, finding among other things that high incomes in QLFS are under-reported or missing comopared to tax data. He estimates that this results in estimates based on this survey data of the Gini on earnings income that is three percentage points lower than in reality (from about 0.57 to 0.60).
+
+Comparison of annual income percentiles of SA adult population in the datasets (R'thousands, 2010/11)
+
+Percentile   | 50     | 58    | 90.65  | 95%   | 97.5%  | 99%    | 99.9%  | 99.99%    
+-------------|--------|-------|--------|-------|--------|--------|--------|-------
+Tax 2011     | N/A    | N/A   | 120    | 199   | 303    | 493    | 1440   | 4357
+IES          | 0      | 8     | 114    | 180   | 276    | 480    | 990    | 1834
+NIDS         | 0      | 0     | 75     | 134   | 230    | 298    | 1443   | 9648
+PALMS        | 0      | 5     | 102    | 153   | 212    | 354    | 1073   | 2553
+
+#4. Methodology
+
+Our method for finding exact percentiles from the given tax tables follows the frequently used Pareto interpolation method outlined by Piketty and Saez (2001). The tax tables give tax brackets with the number of tax payers in each; we choose the tax bracket with cumulative taxpayers closest to the desired percentile, then interpolate what's left assuming a Pareto distribution. In fact, the tax brackets are so close together that barely any interpolation is needed - the table below shows for example that the closest bracket to the 95th percentile is on average 94.96% of the distribution.
+
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+
+Aggreg <- read.csv("AggData.csv")
+Aggreg <- Aggreg[, colSums(is.na(Aggreg)) != nrow(Aggreg)]    #Delete null columns
+Aggreg <- Aggreg[rowSums(is.na(Aggreg)) != ncol(Aggreg), ]    #Delete null rows
+Aggreg <- Aggreg %>% filter(year>=2003)
+
+Bracket <- read.csv("BracketData.csv")
+#Need to subtract capital gains
+Bracket <- prepdata(df=Bracket)
+
+#appendix
+TopStandard <- toppercs(percs=c(seq(0.95,0.99,0.01), 0.999, 0.9999)) %>% mutate(share= 100*share)
+kable(TopStandard %>% group_by(percentile) %>% 
+  summarise("empirical percentile"= mean(emp.perc), "years valid"= sum(valid==T)),
+  caption = "Average empirical and interpolated percentile")
+
+```
+
+Since the tax tables give statistics on tax filers, the threshold for compulsory submission of tax returns is important for the assumption that all top earners are captured. The threshold was instituted in 2006 at R60 000, increasing to R350 000 by 2015. For the years 2015 and 2016, the income level of the 95th percentile of the distribution falls below the threshold, hence table 2 reports only 12 years as valid for analysis in 2015. Similarly, the threshold is above the 96th percentile in 2016. Otherwise, the data covers all legal income for the top percentiles over the period.
+
+Lastly, the calculations of top percentiles and their shares rely crucially on aggregate population and gross national income (GNI) statistics. We use the national statistical agency's midyear estimates for population totals (Stats SA 2015), and online tables from the South African Reserve Bank for GNI (SARB 2017). We had to do some minor interpolation for the population estimates, since estimates are only given for ages 15 and 20, not 18 as desired. While it is not ideal that our results depend partly on the accurate measurement of population and GNI, one should bear in mind that inaccurate measurement in a consistent way will still preserve the underlying trends.
+
+
+#5. Results 
+
+##5.1 Top incomes have grown phenomenally
+
+Top incomes and the income shares of the top 1% have increased astonishingly between 2003 and 2016, as seen in figures 5 and 6 below. While the effects of the 2008 global recession are briefly observed, top incomes and shares quickly bounce back at rapid growth rates. Table 3 shows that, by 2016, the 99th percentile was receiving nearly R800 000 per year. The top 1% held 13% of GNI, and the top 5% held about 28% of GNI. The top 1% trend is illustrative of all top percentiles (see the trends for the 95th percentile in figures 9 and 10 of the appendix): they experienced a phenomenal real compounded average growth rate (CAGR) of over 5%, with real income *doubling* over the 13 year period and income shares increasing steadily, aside from a dip corresponding to the recession.
+
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+knit_hooks$set(inline = function(x) prettyNum(round(x), ",") )
+
+kable(TopStandard %>% filter(valid==T) %>% group_by(percentile) %>% filter(year==max(year)) %>%
+  select(percentile, year, realincome, share, cagr), 
+  caption= "Top percentile shares and incomes in most recent year (growth is over 2003-2015 and real income is in 2016 Rands)")
+
+top1inc <- ggplot(data=TopStandard %>% filter(percentile==0.99, valid==T)) +
+  geom_line(aes(x=year, y=realincome)) +
+  geom_point(aes(x=year, y=realincome)) +
+  scale_x_continuous(breaks=seq(2003,2015,2)) +
+  labs(y="income")
+
+top1share <- ggplot(data=TopStandard %>% filter(percentile==0.99, valid==T)) +
+  geom_line(aes(x=year, y=share)) +
+  geom_point(aes(x=year, y=share)) +
+  scale_x_continuous(breaks=seq(2003,2015,2)) +
+  labs(y="% share")
+
+grid.arrange(top1inc, top1share, ncol=2, nrow=1)
+
+```
+
+
+We can divide the period up into pre- and post-recession. The growth incidence curves (GICs) of figures 7 and 8 show the compounded average growth rate for each percentile over the last 13 years. In South Africa's heyday of high growth, top incomes tracked average GNI growth at just over 5% until about the 98th percentile. But, as we see in figure 8, this has changed post-recession. The growth paths of the country and the top incomes diverge early and clearly, with incomes from the 95th percentile onwards growing at two to three times the GNI growth rate. This extremely worrying trend is indicative of rapidly increasing inequality, and highlights the stark contrast between South African policy aims of inclusive growth and actual growth.
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+#topshares.R line 100 
+
+
+#GIC for pre-recession years 2003-2007
+TopStandard <- toppercs(percs=c(seq(0.95,0.999,0.003), 0.9999), data= Bracket %>% filter(year<=2007)) %>%
+  mutate(cagr=cagr*100, gni.cagr=gni.cagr*100, percentile=as.numeric(percentile)*100)
+gic1 <- ggplot(data=TopStandard %>% mutate(percentile= as.numeric(percentile))) +
+  geom_line(mapping=aes(x=percentile, y=cagr, colour= "GIC")) +
+  geom_point(mapping=aes(x=percentile, y=cagr)) + theme(legend.position="none") +
+  geom_line(mapping=aes(x=percentile, y=gni.cagr, colour= "GNI growth")) +
+  scale_colour_manual("", breaks = c("GIC", "GNI growth"), values= c("red", "blue")) +
+  scale_y_continuous(limits= c(0, 12)) +
+  labs( y="% Annual growth 2003-2007")
+
+#GIC for post recession years 2010-2015
+TopStandard <- toppercs(percs=c(seq(0.95,0.999,0.003), 0.9999), data= Bracket %>% filter(year>=2010))%>%
+  mutate(cagr=cagr*100, gni.cagr=gni.cagr*100, percentile=as.numeric(percentile)*100)
+gic2 <- ggplot(data=TopStandard %>% mutate(percentile= as.numeric(percentile))) +
+  geom_line(mapping=aes(x=percentile, y=cagr, colour= "GIC")) +
+  geom_point(mapping=aes(x=percentile, y=cagr)) + theme(legend.position="none") +
+  geom_line(mapping=aes(x=percentile, y=gni.cagr, colour= "GNI growth")) +
+  scale_colour_manual("", breaks = c("GIC", "GNI growth"), values= c("red", "blue")) +
+  scale_y_continuous(limits= c(0, 12)) +
+  labs(y="% Annual growth 2010-2016")
+
+grid.arrange(gic1, gic2, ncol=2, nrow=1)
+
+```
+
+## 5.2 ... While incomes in the rest of the population have stagnated 
+
+The growth incidence curve for the whole distribution, as seen in figure 11, shows a U-shape. The key shows 'cagr' as the compound average growth rate, 'mean' refers to the average growth in reported survey incomes, and 'gni' refers to official growth in GNI published by SARB. Positive earnings begin at the 59th percentile of the adult income distribution. Growth rates until the 65th percentile are comparable to GNI: these are the lowest wages, of between R200 and R1000 per month (2016 rands). This drops off quickly, and we find the 75th to 90th percentiles stagnate with a CAGR of 1-2%, far below GNI growth over the period. The same story emerges when we track shares of percentiles over time: shares, calculated over total income in PALMS, decrease slightly for the 75-90th percentiles, and are stagnant before this (see figure 12 in the appendix).
+
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+#DistributionAnalysis.R line 260
+
+load("Palms93_17")
+Palms <- Palms %>% filter(year>2002 & (is.na(outlier) | outlier==0)) 
+palms.w <- svydesign(ids=~1, data= Palms, weights= ~ceweight2)
+View(Palms %>% group_by(year) %>% summarise(real_gni= mean(gni_nom*100/cpi)))
+
+Gic <-  gic(perc=seq(0.55,0.99,0.01), egni= 4.255217e+12, sgni=2.769320e+12)
+Gic <- Gic%>% select(cagr, gni, percentile) %>% gather(type, growthRate, cagr:gni) 
+ggplot(data= Gic%>% filter(percentile>=60)) + theme(legend.position="none") +
+  geom_line(mapping=aes(x=percentile, y=growthRate, colour= type)) +
+  labs(y= "% cagr")
+
+
+```
+
+We break up the GICs into two periods as we did for the top incomes using the tax data (see figures 13 and 14 in the appendix). The period 2002-2007 follows a flattened U-shape, but the bottom income growth rates are even higher than before, with the 60-70th decile growing at 10-25% per year in real income. This is explained by the combination of a low base and job growth: official unemployment decreased from 27% to 22% over this period (SARB 2017), likely meaning that those at the bottom received a boost from very little income (perhaps casual intermittent work) to some form of regular employment albeit at low wages. This picture changes completely in the 2010-2014 period, where growth rates are mostly *negative* until the 95th percentile, after which growth picks up. While this supports the narrative that emerged from the tax data, the PALMS estimates of top percentile growth rates (not just levels) are below the tax table estimates.
+
+We resolve this puzzle by picking up a divergence in comparing the PALMS and tax data directly (shifting back by one the tax years, which end on 1 March of each year, to coincide better with PALMS years), shown in figure 15. The PALMS data tracks the tax income estimates reasonably well until 2007 (LFS data), then captures some of the lost ground in the second year of the QLFS data, before the two trends diverge (a similar story emerges for other top percentile incomes and shares). At this point, top incomes in PALMS stagnate, leading to lower growth rates, when they should increase. Indeed, incomes in PALMS seem misrepresented post-recession (for the reasons outlined earlier, we trust tax data much more). Kerr and Wittenberg (2016) note that "labour income data in the QLFS from 2010-2015 is substantially different" to prior waves, due to differing imputation procedures used by StatsSA.
+
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+#Compare graphs
+PercIncs <- distperc(perc= 0.95, dat= Palms)
+TopStandard <- toppercs(percs=0.95)
+TopStandard$dataset <- "Tax"
+PercIncs$dataset <- "PALMS"
+TopStandard <- TopStandard[c(1,3,4,5,12)] 
+Comp <- data.frame(matrix(unlist(rbind(PercIncs, TopStandard)), ncol=5))
+
+#Formatting
+names(Comp) <- names(TopStandard)
+cols <- c("year", "percentile", "realincome", "share")
+convert <- function(x) as.numeric(as.character(x))
+Comp[cols] <- lapply(Comp[cols], convert)
+
+ggplot(data=Comp) +
+  geom_line(aes(x=year, y=realincome, colour=dataset)) +
+  geom_point(aes(x=year, y=realincome, colour=dataset)) +
+  scale_x_continuous(breaks=seq(2003,2015,2)) +
+  labs(y="income")
+
+```
+
+This graph is key because it changes our understanding of growth across the distribution post recession, and raises doubts about estimates of inequality trends post-recession based on survey data. Of course, the problem could lie with the tax data, and the explanation for the divergence requires investigation; yet, tax data is generally more reliable and the next section looks at other indications consistent with high growth rather than stagnation for top incomes. The narrative that emerges from the tax data and graph above is high growth for top percentiles after 2010, and low growth for the rest of the distribution. 
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+
+load("Palms93_17")
+Palms <- Palms %>% filter(year>=2003 & (is.na(outlier) | outlier==0)) 
+palms.w <- svydesign(ids=~1, data= Palms, weights= ~ceweight2)
+View(Palms %>% group_by(year) %>% summarise(real_gni= mean(gni_nom*100/cpi)))
+
+Gic <-  gic(perc=seq(0.55,0.99,0.01), egni= 4.255217e+12, sgni=2.769320e+12)
+Gic <- Gic%>% select(cagr, gni, percentile) %>% gather(type, growthRate, cagr:gni) 
+Gic <- Gic %>% filter(percentile>=60, type=="cagr") %>% select(-type)  %>% mutate(dataset= "PALMS")
+
+TopStandard <- toppercs(percs=c(seq(0.95,0.999,0.003), 0.9999), data= Bracket %>% filter(year<=2015)) %>%
+  mutate(growthRate=cagr*100, percentile=as.numeric(percentile)*100, dataset= "Tax") %>% 
+  select(percentile, growthRate, dataset) %>% group_by(percentile) %>%
+  summarise(growthRate=mean(growthRate), dataset= first(dataset))
+
+Comp <- rbind(TopStandard, Gic)
+ 
+ggplot(data=Comp) +
+  geom_line(aes(x=percentile, y=growthRate, colour=dataset)) +
+  geom_point(aes(x=percentile, y=growthRate, colour=dataset)) +
+  geom_hline(yintercept = 3.6443696) +
+  scale_x_continuous(breaks=seq(60,100,5)) +
+  scale_y_continuous(breaks=seq(-1,6,1), limits = c(0, 6)) +
+  labs(y="% Annual growth")
+
+#get average by income category
+View(Comp %>% mutate(incomecategory=cut(percentile, breaks=c(60, 75, 90, 95,100))) %>%
+       group_by(incomecategory) %>% summarise(cagr= mean(growthRate)))
+gic(perc=c(seq(0.95,1,0.005), 0.9999), egni= 4.255217e+12, sgni=2.769320e+12) %>% 
+  select(cagr, gni, percentile) %>% gather(type, growthRate, cagr:gni) %>%
+  summarise(ave= mean(growthRate))
+
+```
+
+
+#6. Discussion
+
+##6.1 Decomposition of top incomes
+
+While the tax tables are useful for establishing trends, closer analysis requires microfiles. SARS provided us with a 20% representative sample of all tax filers for the tax years 2011 and 2014. To preserve anonymity, individuals with taxable incomes above R10 million are excluded, and instead detailed summary statistics are given. 
+
+We can first of all use these microfiles to check the income and share estimates above. We expect minor differences, with error in the tax tables coming from the interpolation and error in the microfiles coming from the random sampling. The two estimates turn out to be reassuringly close (see tables 4 and 5 in the appendix). We can also check these trends using an independent data source. Consultancy company Deloitte (Yull 2017) tracked the remuneration of CEOs of the JSE top 100 companies. The lower quartile remuneration of a mid-tier company CEO earns over R6 million in total annual pay, which by our estimates above is at about the 99.99th percentile. Here. the CAGR over the last 5 years was over 10%, corresponding to our estimates of high growth for the very top.
+
+Next, the microfiles allow us to disaggregate incomes into their sources. The composition of incomes across percentiles is consistent across 2011 and 2014. Salary and bonus on average make up over 80% of income until the 99th percentile, when salary rapidly diminishes as a proportion of the total. Income from shares, profit, capital gains and bonus become more important as incomes increase, and the average number of sources per person also rises. Tthe GICs in figures 7 and 8 already showed considerable heterogeneity within the top 1%, and here we find that income sources correspondingly shift dramatically over this narrow range. This is hardly surprising, given that the top 1% in South Africa includes everyone earning above R800 000, from your doctor or university professor to a business mogul.
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+#sourcesAnalysis.R line 50
+load("Tax")
+Temp <- Tax %>% 
+  group_by(percentiles, taxyr) %>%
+  summarise(gross= prettyNum(round(mean(grossinclcapgains)),","), 
+            taxable= prettyNum(round(mean(taxableincome)),","),
+            combined= prettyNum(round(mean(combinedsources)), ","),
+            salary= prettyNum(round(mean(income3601)/mean(combinedsources),2),","), 
+            bonus= prettyNum(round(mean(income3605)/mean(combinedsources),2),","), 
+            commission= prettyNum(round(mean(income3606)/mean(combinedsources),2),","), 
+            director= prettyNum(round(mean(income3615)/mean(combinedsources),2),","),
+            capital.gains= prettyNum(round(mean(totcapgains)/mean(combinedsources),2),","),
+            shares= prettyNum(round(mean(shares3707)/mean(combinedsources),2),","), 
+            interest= prettyNum(round(mean(income4201)/mean(combinedsources),2),","),
+            profit= prettyNum(round(mean(profit_01_34range+profit_42range)/mean(combinedsources),2),","),
+            other = prettyNum(round(mean(income_39range + income_36range)/mean(combinedsources),2),","),
+            num.sources= mean(numsources))
+
+#capital income = shares3707 + income4201+ profit_42range + totcapgains + income_39range
+
+#labout income= income3601 + income3605 + income3606 + income3615  + income_36range + profit_01_34range + travel3701
+
+Temp <- gather(Temp, income.sources, mean, salary:other)%>%arrange(percentiles) %>%
+  filter(!is.na(percentiles))
+
+
+cbPalette <- c("#000000", "#999999", "#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#CC79A7")
+
+ggplot(data= Temp ) + scale_fill_manual(values=cbPalette) +
+  geom_col(colour="white", aes(x=percentiles, y=as.numeric(mean), 
+                               fill=income.sources), position="fill") +
+  theme(axis.text.x = element_text(angle=90)) +
+  ylab("Average % income from source") +
+  facet_wrap(~taxyr)
+
+#Look at correlations
+Temp <- Tax %>% filter(!is.na(percentiles)) %>%
+  mutate(capital.income= shares3707 + income4201, 
+         labour.income=   income3601 + income3605+ income3606+ income3615)
+
+Temp %>% group_by(taxyr) %>%
+  summarise(corr= cor(capital.income, labour.income))
+
+#ggplot(data=Temp %>% filter(taxyr==2014)) +
+#  geom_point(aes(x=labour.income, y=capital.income))
+
+#Gender
+
+Tax %>% filter(taxyr==2014) %>% group_by(percentiles, gender) %>% summarise(income= mean(taxableincome)*100/88, number= n()*5)
+
+rm(Tax)
+
+#growth of expenditure items
+
+#decompositions
+#topshares.R line 220
+Pensions <- read.csv("Pensions.csv")
+Pensions <- prepdata(df=Pensions)
+TopPension <- benefitpercs(percs=c(0.95, 0.99), data=Pensions)
+kable(TopPension %>% group_by(percentile) %>% arrange(year) %>% 
+        summarise(income.2015= last(real.average.income), ave.growth=mean(cagr)),
+      caption= "Pension contributions by percentile")
+
+Shareopts <- read.csv("ShareOpts.csv")
+Shareopts <- prepdata(df=Shareopts)
+TopShares <- benefitpercs(percs=c(0.95, 0.99), data=Shareopts)
+kable(TopShares %>% group_by(percentile) %>% arrange(year) %>% 
+        summarise(income.2015= last(real.average.income), ave.growth=mean(cagr)),
+      caption= "Share income by percentile")
+
+Medaid <- read.csv("MedAid.csv")
+Medaid <- prepdata(df=Medaid)
+TopMed <- benefitpercs(percs=c(0.95, 0.99), data=Medaid)
+kable(TopMed %>% group_by(percentile) %>% arrange(year) %>% 
+        summarise(income.2015= last(real.average.income), ave.growth=mean(cagr)),
+      caption= "Medical aid contributions by percentile")
+
+rm(Pensions, TopPension, Shareopts, TopShares, Medaid, TopMed)
+
+
+```
+
+Returning to the tax tables, SARS does provide publicly provide a few breakdowns by taxable income bracket. Gross income is equal to taxable income plus deductions, such as medical aid or pension contributions. This is arguably a better indicator of income, and certainly more reflective of income share since GNI includes these contributions. The trend in gross income and share follows the taxable income trend very closely, as expected, with gross income always higher. The top 1% share is about 2% higher than estimated on taxable income (see figure 16 in the appendix).
+
+The decomposition for income sources/deductions must be interpreted with a little care. Taxpayers are categorised by *total* taxable income bracket, but a particular individual in the 95th percentile may receive income from shares greater than that of a particular person in the 98th percentile. Income from share options has grown at an extraordinary pace since 2003, with a CAGR of over 15% for the top 1% (real terms). Medical aid contributions are also increasing rapidly, corresponding to the broader narrative of rising private healthcare costs in South Africa. For example, the Council for Medical Schemes reports an average increase in contributions of 8% over this period (CMS 2015). Pension contributions, on the other hand, have stagnated, with low average real growth of 1-3% indicating a decline in the proportion of total income allocated to pensions (see tables 7-9 in the appendix).
+
+Finally, SARS releases a "panel" of taxpayers: for the 2016 panel, they categorise the 2005 taxpayers by tax bracket and track those who submitted returns for the following ten years until 2014. We include only taxpayers that were above the highest threshold for compulsory submission of tax returns over the period (R250 000) in 2005 to guard against selection in the panel. We are left with 265 000 tax payers out of about 400 000 original taxpayers above the threshold in 2005 (the exact figure is not given). This corresponds to the "top" 0.85% of the 2005 adult population. Note that there is still some selection, since those whose incomes dropped in nominal terms over the period were not legally required to submit returns and so were less likely to be included in the panel - perhaps a manager on a salary of R250 000 who retired. Therefore, the panel may on average contain higher incomes (this mostly concerns incomes close to the threshold, since for example incomes of R1 million are less likely to drop below R250 000) and growth may be overestimated. In the data, the estimated panel incomes are substantially higher than the "cross-sectional" estimates, as suggested. A stark contrast emerges in figure 18, which shows the divergent evolution of shares: aside from the recession when both shares dip, the panel is stable or decreasing while the cross section is always increasing. Thus the compound average growth rate over the ten years for the panel is much lower than the cross-sectional growth presented in section 5 above, 1.4% compared to 3.8%. While the "2005 rich" did indeed grow their incomes, this indicates that the top percentiles' growth in income and share come primarily from individuals outside of the panel - a newly rich. This warrants further investigation, and may contain clues of the political economy of growth over the post recession period. 
+
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+
+Panel <- read.csv("Panel.csv", check.names = FALSE)
+Panel <- Panel %>% gather(year, bracketIncome, 3:12)
+Panel$year <- as.numeric(Panel$year)
+Panel$adults <- Aggreg$adults[which(Aggreg$year==2005)]
+Aggr <- Aggreg[, c("year", "gni_nom", "cpi")]
+Panel <- merge(Panel, Aggr, by="year")
+
+Panel$bracketIncome <- Panel$bracketIncome*1e6
+Panel <- Panel %>% arrange(year, desc(minBracket)) %>% group_by(year) %>%
+  mutate(cumTaxpayers= cumsum(numTaxpayers), cumIncome= cumsum(bracketIncome))
+
+TopPanel <- Panel %>% filter(minBracket==250000) %>%
+  mutate(percentile= 1-cumTaxpayers/adults) %>%
+  mutate(realincome= cumIncome/cumTaxpayers*100/cpi, share= (cumIncome/gni_nom)*100) 
+#No need to inflation-adjust because only shares
+
+TopCross <- topperc(perc= mean(TopPanel$percentile)) %>% mutate(share=share*100)
+
+ggplot(mapping=aes(x=year, y=share)) +
+  geom_line(data=TopPanel, aes(colour= "Panel")) +
+  geom_line(data= TopCross, aes(colour="Cross section")) +
+  geom_point(data=TopPanel, aes(colour= "Panel")) +
+  geom_point(data= TopCross, aes(colour="Cross section")) +
+  scale_x_continuous(breaks=seq(2003,2015,2)) +
+  scale_colour_manual("",breaks = c("Panel", "Cross section"),
+                      values = c("red", "green")) +
+  ylab("% share")
+
+```
+
+
+## 6.2 Possible explanations for top percentile growth in South Africa
+
+How do we explain the persistent increase in top percentile incomes, particularly in relation to low growth in aggregate national income? Piketty (2013) proposes two forces that drive divergence between top incomes and income in the rest of the distribution. Firstly, "r>g": when capital returns (r) are greater than economic growth rates (g), then those in possession of capital will grow at a faster pace. The divergence grows stronger as the difference between r and g decreases, for example in low growth periods such as 2010-2015 as shown above. The growth incidence curves for top percentiles show runaway growth at the very top, corresponding to those with more income derived from capital (see decomposition into income sources above). However, this does not explain the high growth rates of the 95th-99th percentiles, which derive most of their income from the labour market. A second explanation looks at labour market dynamics. CEOs, managers and others high in the income distribution have more bargaining power because they are less easily replaced or may set their own remuneration, among other reasons. Continuing skills biased technical change (see for example Banerjee et al 2008) may have steadily increased this bargaining power, manifesting in rising top incomes and shares. In a low growth environment, perhaps managers are more likely to receive payment incentives in hopes of boosting performance than ordinary workers, whose salary increases are simply based on CPI or past average firm level performance.
+
+We can shed some light on these explanations by tracking the share of income from capital sources, shown in figure 16. We use decomposition provided in our tax microfiles for 2011 and 2014 and designate income sources into capital (like interest, dividends, or capital gains) and labour market (like salary, bonus and commission). The capital share increases with the percentiles. For 2011, it rises slowly from 10-20% between the 95-99th percentiles, before rapidly increasing to nearly half total income on average. The 2014 distribution dominates this everywhere, and by a large proportion too: 20-30% higher proportionally than in 2011. Capital income grew at a compounded average growth rate of 10-20%, where this growth rate increases with total capital income. Indeed, simply passively investing in the Johannesburg Stock Exchange All Share Index over this period of tax years 2010 to 2015 would have given real returns of nearly 9%; even more strikingly, figure 6 shows that the top 1% failed to grow as much in 2016 and this is reflected in the negligible real returns of the JSE All Share Index of in this year. This gives weighty support to the r>g explanation. Secondly, Labour market income grew at a compounded average growth rate of 2-3%, which compared to GNI growth over the period of 1.5%, is still high and therefore this still keeps a compelling space open for the bargaining power explanation. A final possible explanation is that top percentiles were involved with small sectors that grew much faster than other sectors. This is consistent with the diverging trend between the tax data cross sections and panel given in section 6.1 - perhaps the averages are masking high growth in only a portion of the top percentiles. These explanations require further investigation.
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+load("Rep2011")
+load("Rep2014")
+Reppercs11 <- reppercs() %>% mutate(year=2011, source="microfiles")  
+Reppercs14 <- reppercs(df=Rep2014, adults=35260193, topnum= 1259, topinc=21.71e9, 
+                       gni= 3.66E+12, cpi= 88, topworkinc=  10.11e9, topcapinc= 24.64e9) %>% 
+  mutate(year=2014, source="microfiles") 
+Reppercs <- rbind(Reppercs11, Reppercs14) %>% mutate(percentile=percentile*100, capitalshare= capitalshare*100)
+ggplot(data= Reppercs %>% mutate(year=as.factor(year)), mapping= aes(x= percentile, y= capitalshare, colour=year)) +
+  geom_line() + geom_point() + 
+  ylab("capital share")
+
+# Share calculated over top percentiles. So this just shows concentration. 
+# But we don't expect poor to own much capital
+```
+
+
+##6.3 South Africa's growth path post-1994
+
+U-shaped growth has become characteristic of the South African earnings growth path. Bhorat and Van der Westhuizen (2010) present a growth incidence curve for 1995-2005, showing that the U-shape emerges again. This gives us a complete picture of post-1994 growth (see figure 20 in the appendix for the 1993-2014 GIC using PALMS) - the relative gains are being made at the bottom of the earnings distribution off a low base, the middle experience very little change, and then growth rates increase rapidly at the very top.
+
+Who does this low-growth middle consist of? The PALMS survey data (2016) shows it stretches roughly from the 75-90th percentile of the adult distribution or 40-75th percentile of the adult earning distribution. In 2014, these people were earning between R3 350 and R10 800 per month (2016 rands); 72% were African, 12% Coloured and 62% were male; 40% had matric, where only 15% had some further education; and the majority were in elementary occupations, skilled agricultural/fisheries work or machine operation. For these workers, incomes have decreased twenty years into democracy; and growth does not get much better lower down the distribution. Even more worryingly, this U-shaped pattern of growth has persisted through South Africa's low growth since the recession. Growth was shifted down, though not equally across the distribution. The divergence between GNI and top percentile growth grew, while the bottom did not see the usual (relatively) high rates of growth. What little growth the country has observed over the latest period therefore seems to be a reflection of high growth in top incomes rather than "inclusive growth".
+
+Hence, under U-shaped growth, GNI (or an equivalent aggregate growth measure such as GDP) proves an especially misleading indicator of development. Since income gains at the bottom matter little in absolute terms to the total, GNI growth becomes an indicator of top percentile development. If we change this by excluding top 5% incomes from GNI as in figure 17, the regressive nature of growth in South Africa becomes clear. This "95% GNI" growth is almost everywhere below reported GNI growth. While the global recession coincides with negative growth in 2009, the far more worrying period is the sustained negative growth for the 95% from 2012-2014 (and possibly beyond). If development aims to reach further than the economic elite, then a "95% GNI" or equivalent should be commonly calculated (easily done using the annual tax statistics and reported GNI) and discussed.
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+Gni.95 <- topperc(perc=0.95) %>% group_by(percentile) %>%
+  mutate("95% GNI"= (realgni.95-lag(realgni.95))/lag(realgni.95)*100,
+         "GNI"= (realgni-lag(realgni))/lag(realgni)*100) %>%
+  gather(measure, growth, c("95% GNI", "GNI")) 
+
+ggplot(data=Gni.95%>%filter(valid==T)) +
+  geom_line(aes(x=year, y= growth, colour= measure)) +
+  geom_point(aes(x=year, y= growth, colour= measure)) +
+  scale_x_continuous(breaks=seq(2003,2015,2)) +
+  labs(y= "% cagr")
+```
+
+
+#7. Concluding remarks
+
+The extraordinary growth of the top percentiles at up to three times the growth rate of national income in the post-recession period is alarming in one of the most unequal countries in the world. The corollary is that inequality increased by a large margin. While we have not calculated traditional measures such as the Gini or Atkinson index here, our reports of income shares may be understood as inequality measures too. Moreover, for 95% of the population, 2012-2014 were years of recession: incomes decreased year on year, even as incomes of the top percentiles were growing at over 5% per year. Growth for the 95% has almost always been lower than growth for the top 5%, i.e. growth has not been pro-poor (or growth has been anti-poor). The PALMS data, which *underestimates* top incomes, suggests that by 2014 the top 5% received as much income as the rest of the distribution combined. This pattern was not an artifact of global conditions, since regions with historically high levels of inequality like Latin America have brought down top income shares and with it inequality through pro-poor growth. South Africa once again finds its image in USA, as documented by Piketty and Saez (2013). Along with the resilient growth in top percentile shares over the post-recession period, we find strong annual growth of 10-20% in capital income over 2011-2014, indicating that owners of capital have been prime beneficiaries under South Africa's diverging growth pattern.
+
+The South African literature on growth and inequality has typically relied on survey data to meticulously record the persistence of inequality despite the end of the racist Apartheid regime that was designed to enrich a small white minority. This paper makes some broad remarks on this literature. Survey data will systematically underestimate inequality and, more worryingly, may even get the trend wrong (figure 15). There is a need to look at other sources of data, and we argue that the publicly available, annually computed tax tables are an excellent resource in this regard. Tax data is particularly useful against the weaknesses of survey data: (a) at the top of the income distribution, where survey participants underreport or refuse to answer (imputation does not adequately compensate); and (b) for analysing income from capital sources, which for similar reasons has been underemphasised relative to labour market inequality. Indeed, top incomes and total income (including capital income) are directly enlightening for the focus on inequality, which is concerned with the underlying social processes determining the distribution of resources among people, and deserve as much attention as the Gini coefficient or earnings inequality. It is illustrative that Hundenborn et al (2016) explain their finding of a decrease in the Gini coefficient over 2008-2014 (using survey data) through decreasing labour market inequality; the divergent growth of top incomes over this period suggests an alternative trajectory of inequality in South Africa, and we highlight particularly the growth of capital income which is recorded as 10-20% (real) in some years. A major caveat in this regard is that this paper's focus on income ignores an arguably more socially determinant indicator, wealth. Orthoffer (2016) shows that wealth inequality is far worse than income inequality in South Africa, for example she calculates a Gini coefficient for income of 0.6 and for wealth of 0.95. The divergence between wealth and income increases with income. To illustrate, we estimate crudely from wave 4 of the National Incomes Dynamics Study (Southern Africa Labour and Development Research Unit 2017, own calculations with missing incomes excluded) that the the top 1% of adults have a wealth to income ratio of median 12 and mean 256, compared to the rest of the *earning* adult distribution with median 6 and mean 26. Note this augments the importance of capital income. Incidentally, it also suggests that estimates of high net worth individuals in South Africa are far too low (for example, Credit Suisse 2016 estimates that there are only 45000 dollar millionaires).
+
+An expanded focus on inequality is the natural response to the puzzles outlined in this paper. What are the processes explaining South Africa's persistent and arguably predictable growth path over the last 20 years, i.e. U-shaped growth with non-decreasing inequality? What are the consequences of such a strong and sustained divergence between capital and labour income growth? Does the growth of a new elite suggested by figure 18 correspond to the narrative of a political econmoy compromise, where "white capital" continues growing on condition that it supports a small emerging black elite? This paper presents income trends that paint an even bleaker picture than is implied by the low economic growth post-recession. Yet it is an important reminder that the burden of this low growth has not extended to the top percentiles, raising the urgency to interrogate the underlying economic processes in the project to improve living standards of most people in South Africa.
+
+#References
+Alverado et al. 2017. World Incomes Database [online dataset]. Accessed [24/8/2017]: http://wid.world/ 
+
+Alvaredo and Atkinson. 2010. Colonial Rule, Apartheid and Natural Resources: Top Incomes in South Africa, 1903-2007. CEPR Discussion Paper No. DP8155. Available at SSRN: https://ssrn.com/abstract=1729573
+
+Atkinson and Piketty. 2010. Top Incomes: A Global Perspective. Oxford University Press. 
+
+Banerjee, Levinsohn, McLaren and Woolard. 2006. Why has unemployment risen in the new South Africa? IPC Working Paper Series number 35.
+
+Bhorat and Van der Westhuizen. 2010. Poverty, inequality and the nature of economic growth in South Africa, in Testing Democracy: Which way is South Africa going? Idasa.
+
+CMS. 2015. Council for Medical Schemes Annual Report 2014/15: 15 years on the pulse. Accessed [1/8/2017]: https://www.medicalschemes.com/files/Annual%20Reports/AR2014_2015.pdf
+
+Credit Suisse. 2016. Global Wealth Report 2016. Research institute.
+
+Davis Tax Committee. 2016. Macro analysis of the tax system and inclusive growth in South Africa, Executive summary of the second and final report for the Minister of Finance.
+
+Hundenborn, Leibbrandt and Woolard. 2016. Drivers of Inequality in South Africa. A Southern Africa
+Labour and Development Research Unit Working Paper Number 194. Cape Town: SALDRU, University of
+Cape Town
+
+Kerr and Wittenberg. 2016. A Guide to version 3.1 of the Post-Apartheid Labour Market Series (PALMS)
+
+Kerr, Lam and Wittenberg. 2016. Post-Apartheid Labour Market Series [dataset]. Version 3.1. CapeTown: DataFirst [producer and distributor], 2016.
+
+Kuznets. 1953. Shares of Upper Income Groups in Income and Savings. Cambridge, MA: National Bureau of Economic Research.
+
+Leibbrandt et al. 2010. Trends in South African Income Distribution and Poverty since the Fall of Apartheid. OECD Social, Employment and Migration Working Papers, No. 101, OECD Publishing. http://dx.doi.org/10.1787/5kmms0t7p1ms-en
+
+Orthoffer. 2016. Savings and wealth in the context of extreme inequality. Dissertation, Ch 3. Stellenbosch University.
+
+Piketty. 2013. Capital in the 21st century.
+
+Piketty and Saez. 2013. Top Incomes and the Great Recession: Recent Evolutions and Policy Implications. IMF Economic Review (2013) 61, 456-478.
+
+Piketty and Saez. 2001. Income inequality in the United States, 1913-1998. National Bureau of Economic Research, Working Paper 8467.
+
+South African Reserve Bank. 2017. SARB: Online statistical query. Accessed [2/8/2017]: https://www.resbank.co.za/Publications/QuarterlyBulletins/Pages/QBOnlinestatsquery.aspx
+
+South African Revenue Service. 2017. Tax Statistics [years 2008-2016 used in calculations]. Joint publication between SARS and National Treasury. Accessed [2/8/2017]: http://www.sars.gov.za/About/SATaxSystem/Pages/Tax-Statistics.aspx
+
+Southern Africa Labour and Development Research Unit. 2012. National Income Dynamics Study 2010-2011, Wave 2 [dataset]. Version 2.2. Cape Town: Southern Africa Labour and Development Research Unit [producer], 2012. Cape Town: DataFirst [distributor].
+
+Southern Africa Labour and Development Research Unit. 2017. National Income Dynamics Study 2014-2015, Wave 4 [dataset]. Version 1.1. Cape Town: Southern Africa Labour and Development Research Unit [producer], 2016. Cape Town: DataFirst [distributor].
+
+StatsSA. 2015. Income and Expenditure Survey [dataset]. Statistics South Africa. Last modified: 12/5/2015.
+
+StatsSA. 2015. Midyear Population Estimates. Statistics South Africa. Accessed [2/8/2017]: https://www.statssa.gov.za/publications/P0302/P03022015.pdf
+
+Wittenberg. 2017. Measurement of earnings: Comparing South African tax and survey data.
+Cape Town: SALDRU, UCT. (SALDRU Working Paper Number 212).
+
+World Bank. 2017. Web page, LAC Equity Lab: Economic Growth - Growth Incidence Curve (GIC). Data from Socio-Economic Database for Latin America and the Caribbean. Accessed [2/8/2017]: http://www.worldbank.org/en/topic/poverty/lac-equity-lab1/economic-growth/growth-incidence-curve
+
+Yull. 2017. Shareholder Alignment, Company Performance and Executive Pay: Deloitte Executive Compensation Report, p21-25. 
+
+#Appendix
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+
+#Data
+
+kable(Bracket %>%select(year, minBracket, numTaxpayers, bracketIncome) %>% filter(year==2015 & minBracket>130000), caption = "Example of tax tables data")
+
+Assess <- read.csv("AssessClean.csv")
+Assess <- gather(Assess, year, difference, X2010.diff:X2014.diff)
+ggplot (data=Assess) +
+  geom_point(mapping= aes(x=tax.bracket, y=difference, colour=year)) +
+  theme(axis.text.x = element_text(angle=90)) +
+  labs(y="Difference (proportion)", x="Midpoint of bracket") +
+  xlim(0, 1e6)
+  
+
+
+#Results
+TopStandard <- toppercs(percs=c(seq(0.95,0.99,0.01), 0.9999))
+
+top1inc <- ggplot(data=TopStandard %>% filter(percentile==0.95, valid==T)) +
+  geom_line(aes(x=year, y=realincome)) +
+  geom_point(aes(x=year, y=realincome)) +
+  scale_x_continuous(breaks=seq(2003,2015,2)) +
+  labs(y="income")
+
+top1share <- ggplot(data=TopStandard %>% filter(percentile==0.95, valid==T)) +
+  geom_line(aes(x=year, y=share)) +
+  geom_point(aes(x=year, y=share)) +
+  scale_x_continuous(breaks=seq(2003,2015,2)) +
+  labs(y="% share")
+
+grid.arrange(top1inc, top1share, ncol=2, nrow=1)
+
+
+#GICs from PALMS
+load("Palms93_17")
+Palms <- Palms %>% filter(is.na(outlier) | outlier==0) 
+palms.w <- svydesign(ids=~1, data= Palms, weights= ~ceweight2)
+View(Palms %>% group_by(year) %>% summarise(real_gni= mean(gni_nom*100/cpi)))
+
+Palms <- Palms %>% filter(year>=2003)
+tops <- rbind(distperc(0.65), distperc(0.75), distperc(0.85), distperc(0.95)) %>% 
+  mutate(share= share*100)
+ggplot(data=tops) +
+  geom_line(aes(x=year, y=share, colour=percentile)) +
+  geom_point(aes(x=year, y=share, colour=percentile)) +
+  scale_x_continuous(breaks=seq(2003,2015,2)) + ylab("share (%)")
+
+Gic <- gic(seq(0.6,0.99,0.01), sgni=2.76932e+12, egni= 3.4622e+12, df=subset(Palms, year<=2007 & year>=2003), dsn= subset(palms.w, year<=2007 & year>=2003))
+Gic <- Gic %>% select(-mean) %>%  gather(type, growthRate, cagr:gni)
+gic1 <- ggplot(data=Gic %>% filter(percentile>=61)) + theme(legend.position="none") +
+  geom_line(mapping=aes(x=percentile, y=growthRate, colour= type)) +
+  ylab("% cagr, 2003-2007") + scale_y_continuous(limits= c(-2, 20))
+
+Gic <- gic(seq(0.6,0.99,0.01), sgni= 3.80397E+12, egni= 4.255217e+12, df=subset(Palms, year>=2010), dsn= subset(palms.w, year>=2010))
+Gic <- Gic %>% select(-mean) %>% gather(type, growthRate, cagr:gni)
+gic2 <- ggplot(data=Gic) + theme(legend.position="none") +
+  geom_line(mapping=aes(x=percentile, y=growthRate, colour= type)) +
+  ylab("% cagr, 2010-2015") + scale_y_continuous(limits= c(-2, 20))
+
+grid.arrange(gic1, gic2, ncol=2, nrow=1)
+
+#Robustness
+#IncomeGrowth.R line 50
+
+Temp <- Reppercs11 %>% select(source, year, percentile, realincome, share)
+TopStandard <- toppercs() %>% filter(year==2011) %>% mutate(source="tax.brackets") %>%
+  select(source, year, percentile, realincome, share)
+Comp <- data.frame(matrix(unlist(rbind(Temp, TopStandard)), ncol=5))
+names(Comp) <- names(TopStandard)
+kable(Comp %>% arrange(year, percentile), caption = "Comparison of tax brackets vs. microfiles for 2011")
+
+Temp <- Reppercs14  %>% select(source, year, percentile, realincome, share)
+TopStandard <- toppercs() %>% filter(year==2014) %>% mutate(source="tax.brackets") %>%
+  select(source, year, percentile, realincome, share)
+Comp <- data.frame(matrix(unlist(rbind(Temp, TopStandard)), ncol=5))
+names(Comp) <- names(TopStandard)
+kable(Comp %>% arrange(year, percentile), caption = "Comparison of tax brackets vs. microfiles for 2014")
+
+rm(Rep2011, Rep2014)
+
+#Gross income
+
+#topshares.R line 185
+Grossinc <- read.csv("Grossinc.csv")
+Grossinc <- prepdata(df=Grossinc)
+TopGross <- toppercs(percs=c(0.95, 0.99), data=Grossinc) %>% mutate(source="gross.income")
+TopTax <- toppercs(percs=c(0.95, 0.99), data=Bracket) %>% filter(year>=2008) %>%
+  mutate(source="taxable.income")
+Comp <- rbind(TopGross, TopTax) %>% mutate(type= interaction(percentile, source), share=share*100)
+
+ggplot(data= Comp, mapping=aes(x=year, y=share, colour= type)) +
+  geom_line() +
+  geom_point() +
+  geom_dl(aes(label= type), method = list(dl.combine("last.points"), cex = 0.8)) +
+  theme(legend.position="none") +
+  scale_x_continuous(breaks= seq(2008, 2018, 2), limits=c(2008, 2019)) +
+  labs(y= "share (%)")
+
+
+#Final table of profile
+
+load("Palms93_17")
+#Palms <- Palms %>% filter(is.na(outlier) | outlier==0) 
+#palms.w <- svydesign(ids=~1, data= Palms, weights= ~ceweight2)
+#View(Palms %>% group_by(year) %>% summarise(real_gni= mean(gni_nom*100/cpi)))
+
+#Gic <-  gic(perc=seq(0.55,0.99,0.01), egni= 4.255217e+12, sgni=2.086420e+12)
+#Gic <- Gic%>% select(cagr, gni, percentile) %>% gather(type, growthRate, cagr:gni) 
+# ggplot(data= Gic%>% filter(percentile>=60)) + theme(legend.position="none") +
+#  geom_line(mapping=aes(x=percentile, y=growthRate, colour= type)) +
+#  labs(y= "% cagr")
+
+Palms <- Palms %>% filter(year==2014)
+palms.w <- svydesign(ids=~1, data= Palms, weights= ~ceweight2)
+inccats <- svyquantile(Palms$imprealearnings, palms.w, quantiles= c(0, 0.6, 0.75, 0.9, 0.95, 1))
+Palms$incomecategory <- cut(Palms$imprealearnings, breaks= inccats, right=F)
+summary(Palms$incomecategory)
+names(Palms)
+#consider: age, gender, yrseduc, popgroup, jobindcode
+
+
+View(Palms %>% group_by(incomecategory) %>% 
+       mutate(female= gender=="2. Female", White= popgroup=="4. White", African=popgroup=="1.African/Black",
+              Coloured= popgroup=="2. Coloured") %>%
+       summarise(threshold= min(imprealearnings),
+                 age= mean((age*ceweight2)/mean(ceweight2)), 
+                 female= mean((female*ceweight2)/mean(ceweight2))*100,
+                 African= mean((African*ceweight2)/mean(ceweight2))*100,
+                 Coloured= mean((Coloured*ceweight2)/mean(ceweight2))*100,
+                 White= mean((White*ceweight2)/mean(ceweight2))*100))
+
+View(Palms %>% group_by(incomecategory) %>% select(yrseduc, ceweight2) %>% na.omit() %>%
+       summarise(yrseduc= median((yrseduc*ceweight2)/mean(ceweight2))))
+
+
+
+```
+
+
+
+
